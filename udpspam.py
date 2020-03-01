@@ -19,8 +19,8 @@ def cli():
 @click.command('spam')
 @click.argument('address', default='185.82.21.12')
 @click.argument('port', default=4000)
-@click.option('--rate', default=1, help='Packets per second.')
-@click.option('--timeout', default=1, help='Timeout in seconds.')
+@click.option('--rate', default=1.0, help='Packets per second.')
+@click.option('--timeout', default=1.0, help='Timeout in seconds.')
 @click.option('--filename', default='udpspam.log', help='Timeout in seconds.')
 def spam(address, port, rate, timeout, filename):
     # Error cases
@@ -51,23 +51,25 @@ def spam(address, port, rate, timeout, filename):
             try:
                 send_sock.sendto(payload, (address, port))
                 send_state = 'OK'
-            except RuntimeError as re:
+            except Exception as re:
                 send_state = str(re)
 
             csv_writer.writerow(("out", send_time_in_secs, message_id, send_state))
 
             try:
-                recv_data, addr = send_sock.recvfrom(int(2**16))
-                recv_time_in_secs = time.time()
+                recv_data, _ = send_sock.recvfrom(int(2**16))
+                recv_message_id = int(recv_data.decode())
                 recv_state = 'OK'
-            except RuntimeError as re:
+            except Exception as re:
                 recv_state = str(re)
+                recv_message_id = -1
 
-            csv_writer.writerow(("in", recv_time_in_secs, int(recv_data.decode()), recv_state))
+            recv_time_in_secs = time.time()
+            csv_writer.writerow(("in", recv_time_in_secs, recv_message_id, recv_state))
 
             message_id += 1
             spinner.next()
-            time.sleep(0.01)
+            time.sleep(rate)
 
 
 @click.command()
@@ -76,24 +78,30 @@ def print_stats(filename):
     message_pairs = {}
     with open(filename, 'r') as file_obj:
         reader = csv.reader(file_obj, delimiter=',')
-        for io, t, pl in reader:
+        for io, t, pl, state in reader:
             if io == 'out':
                 if pl in message_pairs:
                     print('Sent message ID "%s" already in index. Looks like a bug' % pl)
                     continue
                 message_pairs[pl] = [float(t), None]
             else:
+                if pl == -1:
+                    print('Received message but something went wrong: "%s". Message ignored.' % state)
+                    continue
                 if pl not in message_pairs:
                     print('Received message ID "%s" not in index. Looks like a bug' % pl)
                     continue
                 message_pairs[pl][1] = float(t)
 
     # produce stats
+    num_message_pairs = len(message_pairs)
+    print('Number of successful messages: %i' % num_message_pairs)
+
     delays = [v[1] - v[0] for k,v in message_pairs.items() if v[1] is not None]
     print('Delay (median/mean/stddev): %f/%f/%f' % (np.median(delays), np.mean(delays), np.std(delays)))
 
     dropped_packets = sum([t_recv is None for _, t_recv in message_pairs.values()])
-    #print('Number of dropped packages: %i' % sum(dropped_packets))
+    print('Number of dropped packages: %i' % dropped_packets)
 
 
 cli.add_command(spam)
