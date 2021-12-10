@@ -1,14 +1,61 @@
 #!/usr/bin/env python
 
 import click
-from progress.spinner import Spinner
-import csv
-import numpy as np
-
-import socket
-import time
+from progress.spinner import PixelSpinner
+import logging
 import signal
-import os
+import trio
+
+logging.basicConfig(filename='udpspam.log',
+                    filemode='a',
+                    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    level=logging.DEBUG)
+
+logger = logging.getLogger(__name__)
+
+
+async def send(address, port, rate):
+    message_id = 0
+    sock = trio.socket.socket(trio.socket.AF_INET,  # Internet
+                              trio.socket.SOCK_DGRAM)  # UDP
+
+    while True:
+        payload = str(message_id).encode()
+        await sock.sendto(payload, (address, port))
+        message_id += 1
+        await trio.sleep(1/rate)
+        logger.info(f'Sent message: {message_id}, to: {address}:{port}')
+
+
+async def receive(address, port):
+    sock = trio.socket.socket(trio.socket.AF_INET,  # Internet
+                              trio.socket.SOCK_DGRAM)  # UDP
+    await sock.bind((address, port))
+
+    while True:
+        data, address = await sock.recvfrom(2048)  # buffer size is 1024 bytes
+        logger.info(f'Received message: {data.decode()}, from: {address[0]}:{address[1]}')
+
+
+async def bounce(address, destport, recvport):
+    sock = trio.socket.socket(trio.socket.AF_INET,  # Internet
+                              trio.socket.SOCK_DGRAM)  # UDP
+    await sock.bind((address, destport))
+
+    while True:
+        recv_data, recv_addr = await sock.recvfrom(int(2**16))
+        #print(f'Received {recv_data.decode()} from {recv_addr}')
+        logger.info(f'Received message: {recv_data.decode()}, from: {recv_addr[0]}:{recv_addr[1]}'
+                    f' at {address}:{destport}. Sending back to: {recv_addr[0]}:{recvport}')
+        await sock.sendto(recv_data, (recv_addr[0], recvport))
+
+
+async def spin(title):
+    spinner = PixelSpinner(title)
+    while True:
+        spinner.next()
+        await trio.sleep(0.1)
 
 
 @click.group()
@@ -17,95 +64,57 @@ def cli():
 
 
 @click.command('spam')
-@click.argument('address', default='185.82.21.12')
-@click.argument('port', default=4000)
+@click.argument('address', default='localhost')
+@click.argument('destport', default=40000)
+@click.argument('recvport', default=40001)
 @click.option('--rate', default=1.0, help='Packets per second.')
-@click.option('--timeout', default=1.0, help='Timeout in seconds.')
-@click.option('--filename', default='udpspam.log', help='Timeout in seconds.')
-def spam(address, port, rate, timeout, filename):
-    # Error cases
-    # - Cannot send package (Network not reachable)
-    # - Package does not get to target / back from target
-    print(address, port, rate, timeout, filename)
+def spam_cmd(address, destport, recvport, rate):
+    print(f'Destination: {address}:{recvport}')
+    print(f'This:        {"localhost"}:{destport}')
 
-    spinner = Spinner('Spamming ')
-    send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    send_sock.settimeout(timeout)
+    fh = logging.FileHandler('spam.log')
+    fh.setLevel(logging.DEBUG)
+    logger.addHandler(fh)
 
-    with open(filename, 'w') as file_obj:
-        csv_writer = csv.writer(file_obj, delimiter=',')
+    async def trio_main():
 
-        def signal_handler(signal, frame):
-            file_obj.close()
-            print('Quit.')
-            os._exit(0)
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(send, address, recvport, rate)
+            nursery.start_soon(receive, "localhost", destport)
+            nursery.start_soon(spin, 'Spamming ')
 
-        signal.signal(signal.SIGINT, signal_handler)
+            with trio.open_signal_receiver(signal.SIGINT) as signal_aiter:
+                async for signum in signal_aiter:
+                    assert signum == signal.SIGINT
+                    nursery.cancel_scope.cancel()
 
-        message_id = 0
-
-        while True:
-            payload = str(message_id).encode()
-            send_time_in_secs = time.time()
-
-            try:
-                send_sock.sendto(payload, (address, port))
-                send_state = 'OK'
-            except Exception as re:
-                send_state = str(re)
-
-            csv_writer.writerow(("out", send_time_in_secs, message_id, send_state))
-
-            try:
-                recv_data, _ = send_sock.recvfrom(int(2**16))
-                recv_message_id = int(recv_data.decode())
-                recv_state = 'OK'
-            except Exception as re:
-                recv_state = str(re)
-                recv_message_id = -1
-
-            recv_time_in_secs = time.time()
-            csv_writer.writerow(("in", recv_time_in_secs, recv_message_id, recv_state))
-
-            message_id += 1
-            spinner.next()
-            time.sleep(rate)
+    trio.run(trio_main)
 
 
-@click.command()
-@click.option('--filename', default='udpspam.log', help='Timeout in seconds.')
-def print_stats(filename):
-    message_pairs = {}
-    with open(filename, 'r') as file_obj:
-        reader = csv.reader(file_obj, delimiter=',')
-        for io, t, pl, state in reader:
-            if io == 'out':
-                if pl in message_pairs:
-                    print('Sent message ID "%s" already in index. Looks like a bug' % pl)
-                    continue
-                message_pairs[pl] = [float(t), None]
-            else:
-                if pl == -1:
-                    print('Received message but something went wrong: "%s". Message ignored.' % state)
-                    continue
-                if pl not in message_pairs:
-                    print('Received message ID "%s" not in index. Looks like a bug' % pl)
-                    continue
-                message_pairs[pl][1] = float(t)
+@click.command('bounce')
+@click.argument('address', default='localhost')
+@click.argument('destport', default=40001)
+@click.argument('recvport', default=40000)
+def bounce_cmd(address, destport, recvport):
+    print(f'Destination: {address}:{recvport}')
+    print(f'This:        {"localhost"}:{destport}')
 
-    # produce stats
-    num_message_pairs = len(message_pairs)
-    print('Number of successful messages: %i' % num_message_pairs)
+    async def trio_main():
 
-    delays = [v[1] - v[0] for k,v in message_pairs.items() if v[1] is not None]
-    print('Delay (median/mean/stddev): %f/%f/%f' % (np.median(delays), np.mean(delays), np.std(delays)))
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(bounce, address, destport, recvport)
+            nursery.start_soon(spin, 'Bouncing ')
 
-    dropped_packets = sum([t_recv is None for _, t_recv in message_pairs.values()])
-    print('Number of dropped packages: %i' % dropped_packets)
+            with trio.open_signal_receiver(signal.SIGINT) as signal_aiter:
+                async for signum in signal_aiter:
+                    assert signum == signal.SIGINT
+                    nursery.cancel_scope.cancel()
+
+    trio.run(trio_main)
 
 
-cli.add_command(spam)
-cli.add_command(print_stats)
+cli.add_command(spam_cmd)
+cli.add_command(bounce_cmd)
 
 if __name__ == '__main__':
     cli()
